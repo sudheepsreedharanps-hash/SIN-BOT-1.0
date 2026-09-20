@@ -1,0 +1,14 @@
+{
+  "name": "vex-guild-bot",
+  "version": "1.0.0",
+  "description": "VEX Guild Discord bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.21.0",
+    "dotenv": "^17.2.1"
+  }
+}
