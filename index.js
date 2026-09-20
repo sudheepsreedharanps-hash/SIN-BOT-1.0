@@ -127,14 +127,6 @@ const MC_AUTO_UPDATE_INTERVAL = 60 * 1000;
 const MC_STATUS_CHANNEL_ID = process.env.MC_STATUS_CHANNEL_ID || null;
 const MC_STATUS_MESSAGE_FILE = path.join(__dirname, "minecraft-status-message.json");
 
-// Optional BlocksMC profile provider. Set BLOCKSMC_PROFILE_API_URL to a reliable
-// BlocksMC profile API endpoint containing {ign}; leave unset if no public
-// BlocksMC profile API is available. The bot never invents missing stats.
-const BLOCKSMC_PROFILE_API_URL = process.env.BLOCKSMC_PROFILE_API_URL || null;
-const BMC_PROFILE_CACHE_TTL = 60 * 1000;
-const BMC_PROFILE_COOLDOWN = 10 * 1000;
-const bmcProfileCache = new Map();
-const bmcProfileCooldowns = new Map();
 
 function encodeVarInt(value) {
     const bytes = [];
@@ -649,344 +641,6 @@ async function startMinecraftAutoStatus() {
 }
 
 // =====================================================
-// BLOCKS MC PLAYER PROFILE
-// =====================================================
-
-function normalizeMinecraftProfileData(data, requestedIgn) {
-    const source = data?.data || data?.player || data?.profile || data || {};
-    const stats = source.stats || source.statistics || source.bedwars || {};
-    const guild = source.guild || source.clan || source.guildInfo || {};
-
-    const pick = (...values) => values.find(value =>
-        value !== undefined && value !== null && value !== ""
-    );
-
-    const username = pick(
-        source.ign,
-        source.username,
-        source.name,
-        source.playerName,
-        requestedIgn
-    );
-
-    const uuid = pick(
-        source.uuid,
-        source.uniqueId,
-        source.id
-    );
-
-    const guildName = typeof guild === "string"
-        ? guild
-        : pick(
-            guild.name,
-            guild.tag,
-            guild.guildName,
-            source.guildName,
-            source.clanName
-        );
-
-    const bedwarsStars = pick(
-        source.bedwarsStars,
-        source.bedwars_stars,
-        source.stars,
-        stats.bedwarsStars,
-        stats.bedwars_stars,
-        stats.stars,
-        stats.level
-    );
-
-    const online = pick(
-        source.online,
-        source.isOnline,
-        source.onlineStatus
-    );
-
-    return {
-        found: Boolean(username || uuid),
-        ign: username,
-        uuid: uuid || null,
-        guild: guildName || null,
-        guildRank: typeof guild === "object"
-            ? pick(guild.rank, guild.role, guild.position)
-            : null,
-        bedwarsStars: bedwarsStars !== undefined
-            ? bedwarsStars
-            : null,
-        online: typeof online === "boolean"
-            ? online
-            : null,
-        skinUrl: pick(
-            source.skinUrl,
-            source.skin,
-            source.avatar,
-            source.avatarUrl,
-            source.head
-        ) || null,
-        raw: data
-    };
-}
-
-async function fetchJsonWithTimeout(url, timeout = 7000) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeout);
-
-    try {
-        const response = await fetch(url, {
-            method: "GET",
-            headers: {
-                "Accept": "application/json",
-                "User-Agent": "S1N-Guild-Discord-Bot/1.0"
-            },
-            signal: controller.signal
-        });
-
-        if (response.status === 404) {
-            const error = new Error("Profile not found");
-            error.code = "NOT_FOUND";
-            throw error;
-        }
-
-        if (response.status === 429) {
-            const error = new Error("Profile API rate limit reached");
-            error.code = "RATE_LIMITED";
-            throw error;
-        }
-
-        if (!response.ok) {
-            throw new Error(`Profile API returned HTTP ${response.status}`);
-        }
-
-        return await response.json();
-    } finally {
-        clearTimeout(timer);
-    }
-}
-
-async function fetchMojangIdentity(ign) {
-    const url = `https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(ign)}`;
-    const response = await fetch(url, {
-        headers: {
-            "Accept": "application/json",
-            "User-Agent": "S1N-Guild-Discord-Bot/1.0"
-        },
-        signal: AbortSignal.timeout(7000)
-    });
-
-    if (response.status === 404 || response.status === 204) {
-        const error = new Error("Minecraft username not found");
-        error.code = "NOT_FOUND";
-        throw error;
-    }
-
-    if (!response.ok) {
-        throw new Error(`Mojang API returned HTTP ${response.status}`);
-    }
-
-    const data = await response.json();
-    return {
-        ign: data.name || ign,
-        uuid: data.id || null
-    };
-}
-
-function uuidWithDashes(uuid) {
-    if (!uuid) return null;
-    const clean = String(uuid).replace(/-/g, "");
-    if (clean.length !== 32) return String(uuid);
-    return `${clean.slice(0, 8)}-${clean.slice(8, 12)}-${clean.slice(12, 16)}-${clean.slice(16, 20)}-${clean.slice(20)}`;
-}
-
-async function getMinecraftSkinUrl(uuid) {
-    const dashed = uuidWithDashes(uuid);
-    if (!dashed) return null;
-
-    try {
-        const response = await fetch(
-            `https://sessionserver.mojang.com/session/minecraft/profile/${encodeURIComponent(String(uuid).replace(/-/g, ""))}`,
-            {
-                headers: {
-                    "Accept": "application/json",
-                    "User-Agent": "S1N-Guild-Discord-Bot/1.0"
-                },
-                signal: AbortSignal.timeout(7000)
-            }
-        );
-
-        if (!response.ok) return null;
-        const data = await response.json();
-        const texturesProperty = Array.isArray(data.properties)
-            ? data.properties.find(property => property.name === "textures")
-            : null;
-
-        if (!texturesProperty?.value) return null;
-
-        const decoded = JSON.parse(
-            Buffer.from(texturesProperty.value, "base64").toString("utf8")
-        );
-
-        return decoded?.textures?.SKIN?.url || null;
-    } catch {
-        return null;
-    }
-}
-
-async function detectMinecraftPlayerOnline(ign) {
-    try {
-        const status = await queryMinecraftServer();
-        const sample = status?.raw?.players?.sample;
-
-        if (!Array.isArray(sample)) return null;
-
-        return sample.some(player =>
-            String(player?.name || "").toLowerCase() === String(ign).toLowerCase()
-        );
-    } catch {
-        return null;
-    }
-}
-
-async function fetchBlocksMCProfile(ign) {
-    const cached = bmcProfileCache.get(ign.toLowerCase());
-    if (cached && Date.now() - cached.timestamp < BMC_PROFILE_CACHE_TTL) {
-        return cached.data;
-    }
-
-    let identity;
-    try {
-        identity = await fetchMojangIdentity(ign);
-    } catch (error) {
-        if (error.code === "NOT_FOUND") throw error;
-        throw new Error("Minecraft identity lookup failed");
-    }
-
-    let providerData = null;
-    let providerError = null;
-
-    if (BLOCKSMC_PROFILE_API_URL) {
-        try {
-            const url = BLOCKSMC_PROFILE_API_URL.replace(
-                /\{ign\}/gi,
-                encodeURIComponent(identity.ign)
-            );
-            providerData = await fetchJsonWithTimeout(url);
-        } catch (error) {
-            providerError = error;
-        }
-    }
-
-    const normalized = providerData
-        ? normalizeMinecraftProfileData(providerData, identity.ign)
-        : {
-            found: true,
-            ign: identity.ign,
-            uuid: null,
-            guild: null,
-            guildRank: null,
-            bedwarsStars: null,
-            online: null,
-            skinUrl: null
-        };
-
-    normalized.ign = normalized.ign || identity.ign;
-    normalized.uuid = normalized.uuid || identity.uuid;
-    normalized.skinUrl = normalized.skinUrl || await getMinecraftSkinUrl(normalized.uuid);
-
-    if (normalized.online === null) {
-        normalized.online = await detectMinecraftPlayerOnline(normalized.ign);
-    }
-
-    if (!providerData && BLOCKSMC_PROFILE_API_URL && providerError?.code === "NOT_FOUND") {
-        const error = new Error("BlocksMC profile not found");
-        error.code = "NOT_FOUND";
-        throw error;
-    }
-
-    if (providerError) {
-        normalized.providerError = providerError.message || "BlocksMC profile provider unavailable";
-    }
-
-    bmcProfileCache.set(ign.toLowerCase(), {
-        timestamp: Date.now(),
-        data: normalized
-    });
-
-    return normalized;
-}
-
-function isBmcProfileRateLimited(userId) {
-    const now = Date.now();
-    const previous = bmcProfileCooldowns.get(userId) || 0;
-    const elapsed = now - previous;
-
-    if (elapsed < BMC_PROFILE_COOLDOWN) {
-        return Math.ceil((BMC_PROFILE_COOLDOWN - elapsed) / 1000);
-    }
-
-    bmcProfileCooldowns.set(userId, now);
-    return 0;
-}
-
-function createBlocksMCProfileEmbed(profile) {
-    const embed = new EmbedBuilder()
-        .setTitle("🎮 BlocksMC Player Profile")
-        .setColor(profile.online === true ? 0x57F287 : 0x5865F2)
-        .addFields(
-            {
-                name: "👤 IGN",
-                value: `\`${String(profile.ign || "Unknown").slice(0, 100)}\``,
-                inline: true
-            },
-            {
-                name: "🏰 Guild",
-                value: profile.guild
-                    ? `\`${String(profile.guild).slice(0, 100)}\``
-                    : "Not publicly available",
-                inline: true
-            },
-            {
-                name: "⭐ BedWars Stars",
-                value: profile.bedwarsStars !== null && profile.bedwarsStars !== undefined
-                    ? `\`${String(profile.bedwarsStars)} ★\``
-                    : "Not publicly available",
-                inline: true
-            },
-            {
-                name: "🆔 Minecraft UUID",
-                value: profile.uuid
-                    ? `\`${uuidWithDashes(profile.uuid)}\``
-                    : "Not available",
-                inline: false
-            },
-            {
-                name: "🟢 Status",
-                value: profile.online === true
-                    ? "Online"
-                    : profile.online === false
-                        ? "Offline"
-                        : "Unknown",
-                inline: true
-            }
-        )
-        .setFooter({
-            text: "BlocksMC • Only retrieved statistics are displayed"
-        })
-        .setTimestamp();
-
-    if (profile.skinUrl) {
-        embed.setThumbnail(profile.skinUrl);
-    }
-
-    if (profile.providerError) {
-        embed.setDescription(
-            "ℹ️ Some BlocksMC-specific statistics could not be retrieved from the configured public profile provider. " +
-            "Only verified Minecraft identity information is shown."
-        );
-    }
-
-    return embed;
-}
-
-// =====================================================
 // STAFF CHECK
 // =====================================================
 
@@ -1033,7 +687,7 @@ async function addWarning(member, reason) {
             .setColor(0xED4245)
             .setTitle("⚠️ S1N GUILD WARNING")
             .setDescription(
-                "Your message was removed because it violated the **S1N Guild rules**.\n\n" +
+                "You have received a **moderation warning** in S1N Guild.\n\n" +
                 `📌 **Reason:** ${reason}\n` +
                 `⚠️ **Warnings:** ${count}/${WARNINGS_BEFORE_TIMEOUT}\n\n` +
                 (
@@ -1355,6 +1009,24 @@ const commands = [
         ),
 
     new SlashCommandBuilder()
+        .setName("warn")
+        .setDescription("Warn a member with a reason")
+        .addUserOption(option =>
+            option
+                .setName("user")
+                .setDescription("Member to warn")
+                .setRequired(true)
+        )
+        .addStringOption(option =>
+            option
+                .setName("reason")
+                .setDescription("Reason for the warning")
+                .setRequired(true)
+                .setMinLength(1)
+                .setMaxLength(500)
+        ),
+
+    new SlashCommandBuilder()
         .setName("clear-warnings")
         .setDescription(
             "Clear warnings"
@@ -1391,20 +1063,12 @@ const commands = [
         ),
 
     new SlashCommandBuilder()
-        .setName("bmc")
-        .setDescription("BlocksMC player tools")
+        .setName("gambling")
+        .setDescription("Show the fun-only gambling registration panel")
         .addSubcommand(subcommand =>
             subcommand
-                .setName("profile")
-                .setDescription("View a BlocksMC player's profile")
-                .addStringOption(option =>
-                    option
-                        .setName("ign")
-                        .setDescription("Minecraft username")
-                        .setRequired(true)
-                        .setMinLength(3)
-                        .setMaxLength(16)
-                )
+                .setName("register")
+                .setDescription("Open the fun-only gambling registration panel")
         ),
 
     new SlashCommandBuilder()
@@ -1641,72 +1305,52 @@ client.on(
                 } = interaction;
 
                 // =============================================
-                // BLOCKS MC PLAYER PROFILE
+                // FUN-ONLY GAMBLING REGISTRATION
                 // =============================================
 
-                if (
-                    commandName === "bmc" &&
-                    options.getSubcommand() === "profile"
-                ) {
-                    const remaining =
-                        isBmcProfileRateLimited(user.id);
+                if (commandName === "gambling" && options.getSubcommand() === "register") {
+                    const websiteUrl = "https://s1ngambles.netlify.app/";
+                    const oauthClientId = process.env.DISCORD_OAUTH_CLIENT_ID;
+                    const oauthRedirectUri = process.env.DISCORD_OAUTH_REDIRECT_URI;
 
-                    if (remaining > 0) {
-                        return interaction.reply({
-                            content:
-                                `⏳ Please wait ${remaining}s before looking up another BlocksMC profile.`,
-                            ephemeral: true
-                        });
-                    }
+                    const row = new ActionRowBuilder().addComponents(
+                        new ButtonBuilder()
+                            .setLabel("🎰 Enter Fun Gambling")
+                            .setStyle(ButtonStyle.Link)
+                            .setURL(websiteUrl),
+                        new ButtonBuilder()
+                            .setLabel("🔗 Connect Discord")
+                            .setStyle(ButtonStyle.Link)
+                            .setURL(
+                                oauthClientId && oauthRedirectUri
+                                    ? `https://discord.com/oauth2/authorize?client_id=${encodeURIComponent(oauthClientId)}&response_type=code&redirect_uri=${encodeURIComponent(oauthRedirectUri)}&scope=identify`
+                                    : websiteUrl
+                            )
+                    );
 
-                    const ign = options
-                        .getString("ign", true)
-                        .trim();
+                    const embed = new EmbedBuilder()
+                        .setColor(0x5865F2)
+                        .setTitle("🎰 Fun Gambling Registration")
+                        .setDescription(
+                            "This server does **not promote or endorse real-money gambling**.\n\n" +
+                            "This feature is **fictional/fun-only** for server members. No real money, deposits, withdrawals, prizes, or cash wagering are supported by this Discord bot.\n\n" +
+                            "🔞 **18+ only** — Discord's current age-restricted command rules require age-restricted app functionality to be limited to adults.\n\n" +
+                            "By continuing to the website, review its own terms and age requirements before using any feature."
+                        )
+                        .addFields({
+                            name: "🌐 Website",
+                            value: `[s1ngambles.netlify.app](${websiteUrl})`,
+                            inline: false
+                        })
+                        .setFooter({
+                            text: "S1N Guild • Fun-only / no real-money gambling"
+                        })
+                        .setTimestamp();
 
-                    if (!/^[A-Za-z0-9_]{3,16}$/.test(ign)) {
-                        return interaction.reply({
-                            content:
-                                "❌ Invalid Minecraft IGN. Use 3–16 letters, numbers, or underscores.",
-                            ephemeral: true
-                        });
-                    }
-
-                    await interaction.deferReply();
-
-                    try {
-                        const profile =
-                            await fetchBlocksMCProfile(ign);
-
-                        return interaction.editReply({
-                            embeds: [
-                                createBlocksMCProfileEmbed(profile)
-                            ]
-                        });
-                    } catch (error) {
-                        console.error(
-                            "❌ BlocksMC profile lookup failed:",
-                            error.message || error
-                        );
-
-                        if (error.code === "NOT_FOUND") {
-                            return interaction.editReply({
-                                content:
-                                    `❌ I couldn't find a Minecraft/BlocksMC profile for \`${ign}\`.`
-                            });
-                        }
-
-                        if (error.code === "RATE_LIMITED") {
-                            return interaction.editReply({
-                                content:
-                                    "⏳ The BlocksMC profile provider is rate-limiting requests. Please try again shortly."
-                            });
-                        }
-
-                        return interaction.editReply({
-                            content:
-                                "❌ I couldn't retrieve that BlocksMC profile right now. Please try again later."
-                        });
-                    }
+                    return interaction.reply({
+                        embeds: [embed],
+                        components: [row]
+                    });
                 }
 
                 // =============================================
@@ -1806,7 +1450,7 @@ client.on(
                                 "🔗 `/invite` — Official invite\n" +
                                 "📊 `/level` — Check level\n" +
                                 "🎮 `/mcstatus` — View live BlocksMC status\n" +
-                                "👤 `/bmc profile <ign>` — View a BlocksMC player profile\n\n" +
+                                "🎰 `/gambling register` — Fun-only gambling registration\n" +
 
                                 "🎫 `/setup-ticket` — Support panel\n" +
                                 "🏆 `/setup-tournament` — Tournament panel\n" +
@@ -1818,6 +1462,7 @@ client.on(
                                 "🏁 `/giveaway-end` — End giveaway\n" +
                                 "📢 `/announcement` — Announcement\n\n" +
 
+                                "⚠️ `/warn <user> <reason>` — Warn a member\n" +
                                 "⚠️ `/warnings` — Check warnings\n" +
                                 "🔨 `/timeout` — Timeout member\n" +
                                 "👢 `/kick` — Kick member\n\n" +
@@ -2716,6 +2361,79 @@ if (
                                 ? "🏆 Giveaway ended."
                                 : "❌ Giveaway not found.",
                         ephemeral: true
+                    });
+                }
+
+                // =============================================
+                // WARN MEMBER
+                // =============================================
+
+                if (commandName === "warn") {
+                    if (!isStaff(member)) {
+                        return interaction.reply({
+                            content: "❌ No permission.",
+                            ephemeral: true
+                        });
+                    }
+
+                    const targetUser = options.getUser("user", true);
+                    const reason = options.getString("reason", true).trim();
+
+                    if (!reason) {
+                        return interaction.reply({
+                            content: "❌ Please provide a reason for the warning.",
+                            ephemeral: true
+                        });
+                    }
+
+                    const targetMember = await guild.members.fetch(targetUser.id).catch(() => null);
+
+                    if (!targetMember) {
+                        return interaction.reply({
+                            content: "❌ That user is not a member of this server.",
+                            ephemeral: true
+                        });
+                    }
+
+                    if (targetMember.id === user.id) {
+                        return interaction.reply({
+                            content: "❌ You cannot warn yourself.",
+                            ephemeral: true
+                        });
+                    }
+
+                    if (targetMember.id === client.user.id) {
+                        return interaction.reply({
+                            content: "❌ I cannot warn myself.",
+                            ephemeral: true
+                        });
+                    }
+
+                    if (targetMember.roles.highest.position >= member.roles.highest.position &&
+                        guild.ownerId !== user.id) {
+                        return interaction.reply({
+                            content: "❌ You can only warn members below your highest role.",
+                            ephemeral: true
+                        });
+                    }
+
+                    const count = await addWarning(targetMember, reason);
+
+                    return interaction.reply({
+                        embeds: [
+                            new EmbedBuilder()
+                                .setColor(0xED4245)
+                                .setTitle("⚠️ Member Warned")
+                                .setDescription(
+                                    `${targetMember} has received a warning.`
+                                )
+                                .addFields(
+                                    { name: "👤 Member", value: `${targetMember.user.tag}`, inline: true },
+                                    { name: "📌 Reason", value: reason.slice(0, 1024), inline: true },
+                                    { name: "⚠️ Warnings", value: `${count}/${WARNINGS_BEFORE_TIMEOUT}`, inline: true }
+                                )
+                                .setTimestamp()
+                        ]
                     });
                 }
 
