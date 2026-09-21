@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const http = require("http");
 const crypto = require("crypto");
+const net = require("net");
 
 const {
     Client,
@@ -42,6 +43,7 @@ const BIRTHDAY_ANNOUNCEMENT_CHANNEL_ID = "1511077202932924526";
 const ADMIN_REGISTRATION_CHANNEL_ID = "1539321230652473404";
 
 const S1N_INVITE = "https://discord.gg/invite/S1NS";
+
 
 // 5 warnings = 10 minute timeout
 const WARNINGS_BEFORE_TIMEOUT = 5;
@@ -95,24 +97,6 @@ function saveJson(file, data) {
     }
 }
 
-const s1nCredits = loadJson(CREDITS_FILE, {});
-const webSessions = new Map();
-
-function getCredits(userId) {
-    const value = Number(s1nCredits[userId]);
-    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
-}
-
-function setCredits(userId, amount) {
-    s1nCredits[userId] = Math.max(0, Math.floor(Number(amount) || 0));
-    saveJson(CREDITS_FILE, s1nCredits);
-    return s1nCredits[userId];
-}
-
-function addCredits(userId, amount) {
-    return setCredits(userId, getCredits(userId) + Number(amount || 0));
-}
-
 const birthdays = new Map(
     Object.entries(loadJson(BIRTHDAY_FILE, {}))
 );
@@ -131,16 +115,558 @@ const giveaways = new Map(
 
 let botConfig = loadJson(CONFIG_FILE, {
     levelChannelId: null,
-    maintenance: false,
-    serverMute: false
+    maintenance: false
 });
 
-// Make sure old config files get the new setting
-if (typeof botConfig.serverMute !== "boolean") {
-    botConfig.serverMute = false;
+const warnings = new Map();
+
+const s1nCredits = loadJson(CREDITS_FILE, {});
+const webSessions = new Map();
+
+function getCredits(userId) {
+    const value = Number(s1nCredits[userId]);
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 }
 
-const warnings = new Map();
+function setCredits(userId, amount) {
+    s1nCredits[userId] = Math.max(0, Math.floor(Number(amount) || 0));
+    saveJson(CREDITS_FILE, s1nCredits);
+    return s1nCredits[userId];
+}
+
+function addCredits(userId, amount) {
+    return setCredits(userId, getCredits(userId) + Number(amount || 0));
+}
+
+// Minecraft status refresh cooldowns (per user)
+const mcRefreshCooldowns = new Map();
+
+// =====================================================
+// MINECRAFT SERVER STATUS - BLOCKS MC
+// =====================================================
+
+const MC_SERVER_HOST = "play.blocksmc.com";
+const MC_SERVER_PORT = 25565;
+const MC_SUPPORTED_VERSIONS = "1.8.9 → 1.21.x";
+const MC_WEBSITE_URL = "https://blocksmc.com";
+const MC_STATUS_TIMEOUT = 7000;
+const MC_REFRESH_COOLDOWN = 15 * 1000;
+const MC_AUTO_UPDATE_INTERVAL = 60 * 1000;
+const MC_STATUS_CHANNEL_ID = process.env.MC_STATUS_CHANNEL_ID || null;
+const MC_STATUS_MESSAGE_FILE = path.join(__dirname, "minecraft-status-message.json");
+
+
+function encodeVarInt(value) {
+    const bytes = [];
+    let unsigned = value >>> 0;
+
+    do {
+        let temp = unsigned & 0x7f;
+        unsigned >>>= 7;
+        if (unsigned !== 0) temp |= 0x80;
+        bytes.push(temp);
+    } while (unsigned !== 0);
+
+    return Buffer.from(bytes);
+}
+
+function encodeString(value) {
+    const data = Buffer.from(value, "utf8");
+    return Buffer.concat([
+        encodeVarInt(data.length),
+        data
+    ]);
+}
+
+function encodePacket(packetId, payload = Buffer.alloc(0)) {
+    const body = Buffer.concat([
+        encodeVarInt(packetId),
+        payload
+    ]);
+
+    return Buffer.concat([
+        encodeVarInt(body.length),
+        body
+    ]);
+}
+
+function encodeLong(value) {
+    const buffer = Buffer.alloc(8);
+    buffer.writeBigInt64BE(BigInt(value));
+    return buffer;
+}
+
+function tryReadVarInt(buffer, offset = 0) {
+    let value = 0;
+    let shift = 0;
+
+    for (let i = 0; i < 5; i++) {
+        if (offset + i >= buffer.length) return null;
+
+        const byte = buffer[offset + i];
+        value |= (byte & 0x7f) << shift;
+
+        if ((byte & 0x80) === 0) {
+            return {
+                value: value >>> 0,
+                bytes: i + 1
+            };
+        }
+
+        shift += 7;
+    }
+
+    throw new Error("Invalid Minecraft VarInt");
+}
+
+function createMinecraftReader(socket) {
+    let buffer = Buffer.alloc(0);
+    let closed = false;
+    const waiters = [];
+
+    const failAll = error => {
+        closed = true;
+        while (waiters.length) {
+            waiters.shift().reject(error);
+        }
+    };
+
+    const process = () => {
+        while (waiters.length) {
+            const waiter = waiters[0];
+            const lengthInfo = tryReadVarInt(buffer);
+            if (!lengthInfo) return;
+
+            const total = lengthInfo.bytes + lengthInfo.value;
+            if (buffer.length < total) return;
+
+            const packet = buffer.subarray(
+                lengthInfo.bytes,
+                total
+            );
+
+            buffer = buffer.subarray(total);
+            waiters.shift().resolve(packet);
+        }
+    };
+
+    const onData = chunk => {
+        buffer = Buffer.concat([buffer, chunk]);
+        try {
+            process();
+        } catch (error) {
+            failAll(error);
+            socket.destroy();
+        }
+    };
+
+    const onError = error => failAll(error);
+    const onClose = () => failAll(new Error("Minecraft server connection closed"));
+
+    socket.on("data", onData);
+    socket.once("error", onError);
+    socket.once("close", onClose);
+
+    return {
+        readPacket(timeout = MC_STATUS_TIMEOUT) {
+            const existing = tryReadVarInt(buffer);
+            if (existing && buffer.length >= existing.bytes + existing.value) {
+                const total = existing.bytes + existing.value;
+                const packet = buffer.subarray(existing.bytes, total);
+                buffer = buffer.subarray(total);
+                return Promise.resolve(packet);
+            }
+
+            if (closed) {
+                return Promise.reject(
+                    new Error("Minecraft server connection closed")
+                );
+            }
+
+            return new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    const index = waiters.findIndex(
+                        item => item.resolve === wrappedResolve
+                    );
+
+                    if (index !== -1) waiters.splice(index, 1);
+                    reject(new Error("Minecraft server response timed out"));
+                }, timeout);
+
+                const wrappedResolve = packet => {
+                    clearTimeout(timer);
+                    resolve(packet);
+                };
+
+                const wrappedReject = error => {
+                    clearTimeout(timer);
+                    reject(error);
+                };
+
+                waiters.push({
+                    resolve: wrappedResolve,
+                    reject: wrappedReject
+                });
+                process();
+            });
+        },
+        cleanup() {
+            socket.removeListener("data", onData);
+            socket.removeListener("error", onError);
+            socket.removeListener("close", onClose);
+        }
+    };
+}
+
+function decodeMinecraftString(packet, offset) {
+    const lengthInfo = tryReadVarInt(packet, offset);
+    if (!lengthInfo) throw new Error("Invalid Minecraft string length");
+
+    const start = offset + lengthInfo.bytes;
+    const end = start + lengthInfo.value;
+
+    if (end > packet.length) {
+        throw new Error("Invalid Minecraft string payload");
+    }
+
+    return {
+        value: packet.subarray(start, end).toString("utf8"),
+        nextOffset: end
+    };
+}
+
+async function queryMinecraftServer() {
+    const startedAt = Date.now();
+
+    return new Promise((resolve, reject) => {
+        const socket = new net.Socket();
+        let settled = false;
+        let reader = null;
+
+        const finish = (error, result) => {
+            if (settled) return;
+            settled = true;
+
+            if (reader) reader.cleanup();
+            socket.destroy();
+
+            if (error) reject(error);
+            else resolve(result);
+        };
+
+        socket.setTimeout(MC_STATUS_TIMEOUT);
+
+        socket.once("timeout", () => {
+            finish(new Error("Minecraft server connection timed out"));
+        });
+
+        socket.once("error", error => {
+            finish(error);
+        });
+
+        socket.connect(
+            MC_SERVER_PORT,
+            MC_SERVER_HOST,
+            async () => {
+                try {
+                    reader = createMinecraftReader(socket);
+
+                    // Status handshake. Protocol version is deliberately neutral;
+                    // the server's own response is used for the displayed version.
+                    const handshakePayload = Buffer.concat([
+                        encodeVarInt(760),
+                        encodeString(MC_SERVER_HOST),
+                        Buffer.from([
+                            (MC_SERVER_PORT >> 8) & 0xff,
+                            MC_SERVER_PORT & 0xff
+                        ]),
+                        encodeVarInt(1)
+                    ]);
+
+                    socket.write(
+                        encodePacket(0x00, handshakePayload)
+                    );
+
+                    socket.write(
+                        encodePacket(0x00)
+                    );
+
+                    const statusPacket =
+                        await reader.readPacket();
+
+                    const statusPacketId =
+                        tryReadVarInt(statusPacket);
+
+                    if (!statusPacketId || statusPacketId.value !== 0x00) {
+                        throw new Error("Invalid Minecraft status response");
+                    }
+
+                    const statusJson =
+                        decodeMinecraftString(
+                            statusPacket,
+                            statusPacketId.bytes
+                        ).value;
+
+                    const status = JSON.parse(statusJson);
+
+                    const pingStartedAt = Date.now();
+                    const pingPayload = encodeLong(pingStartedAt);
+
+                    socket.write(
+                        encodePacket(0x01, pingPayload)
+                    );
+
+                    const pongPacket =
+                        await reader.readPacket();
+
+                    const pongId =
+                        tryReadVarInt(pongPacket);
+
+                    if (!pongId || pongId.value !== 0x01) {
+                        throw new Error("Invalid Minecraft pong response");
+                    }
+
+                    const ping = Math.max(
+                        0,
+                        Date.now() - pingStartedAt
+                    );
+
+                    const players = status.players || {};
+                    const version = status.version || {};
+
+                    finish(null, {
+                        online: true,
+                        players: Number.isFinite(players.online)
+                            ? players.online
+                            : 0,
+                        maxPlayers: Number.isFinite(players.max)
+                            ? players.max
+                            : 0,
+                        version: version.name || "Unknown",
+                        ping,
+                        retrievedAt: Date.now(),
+                        raw: status
+                    });
+                } catch (error) {
+                    finish(error);
+                }
+            }
+        );
+    });
+}
+
+function createMinecraftStatusEmbed(result) {
+    const embed = new EmbedBuilder()
+        .setTitle("🎮 BLOCKS MC")
+        .setColor(result.online ? 0x57F287 : 0xED4245)
+        .addFields(
+            {
+                name: "🟢 Status",
+                value: result.online
+                    ? "Online"
+                    : "Offline",
+                inline: true
+            },
+            {
+                name: "👥 Players",
+                value: result.online
+                    ? `${result.players.toLocaleString()} / ${result.maxPlayers.toLocaleString()}`
+                    : "Unavailable",
+                inline: true
+            },
+            {
+                name: "🎮 Server Version",
+                value: result.online
+                    ? String(result.version).slice(0, 1024)
+                    : "Unavailable",
+                inline: true
+            },
+            {
+                name: "🎮 Supported Versions",
+                value: MC_SUPPORTED_VERSIONS,
+                inline: true
+            },
+            {
+                name: "📡 Server Ping",
+                value: result.online && Number.isFinite(result.ping)
+                    ? `${result.ping} ms`
+                    : "Unavailable",
+                inline: true
+            },
+            {
+                name: "🌐 Server Address",
+                value: `\`${MC_SERVER_HOST}\``,
+                inline: true
+            }
+        )
+        .setFooter({
+            text: result.online
+                ? "BlocksMC • Live server status"
+                : "BlocksMC • Live server information unavailable"
+        })
+        .setTimestamp(
+            result.retrievedAt || Date.now()
+        );
+
+    if (!result.online) {
+        embed.setDescription(
+            "🔴 **Status: Offline**\n\n" +
+            "Live server information could not be retrieved. " +
+            "The server may be offline, unreachable, rate-limited, or returned an invalid response."
+        );
+    }
+
+    return embed;
+}
+
+function createMinecraftStatusButtons() {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setLabel("Website")
+            .setEmoji("🌐")
+            .setStyle(ButtonStyle.Link)
+            .setURL(MC_WEBSITE_URL),
+        new ButtonBuilder()
+            .setCustomId("mcstatus_refresh")
+            .setLabel("Refresh")
+            .setEmoji("🔄")
+            .setStyle(ButtonStyle.Secondary)
+    );
+}
+
+function isMinecraftRefreshRateLimited(userId) {
+    const now = Date.now();
+    const previous = mcRefreshCooldowns.get(userId) || 0;
+
+    if (now - previous < MC_REFRESH_COOLDOWN) {
+        return Math.ceil(
+            (MC_REFRESH_COOLDOWN - (now - previous)) / 1000
+        );
+    }
+
+    mcRefreshCooldowns.set(userId, now);
+    return 0;
+}
+
+async function getMinecraftStatusResult() {
+    try {
+        return await queryMinecraftServer();
+    } catch (error) {
+        console.error(
+            "❌ BlocksMC status query failed:",
+            error.message || error
+        );
+
+        return {
+            online: false,
+            players: 0,
+            maxPlayers: 0,
+            version: "Unavailable",
+            ping: null,
+            retrievedAt: Date.now(),
+            error: error.message || "Unknown server status error"
+        };
+    }
+}
+
+async function updateMinecraftStatusMessage(channel, messageId = null) {
+    if (!channel || !channel.isTextBased()) return null;
+
+    const result = await getMinecraftStatusResult();
+    const payload = {
+        embeds: [createMinecraftStatusEmbed(result)],
+        components: [createMinecraftStatusButtons()]
+    };
+
+    try {
+        let message = null;
+
+        if (messageId) {
+            message = await channel.messages.fetch(messageId).catch(() => null);
+        }
+
+        if (message) {
+            await message.edit(payload);
+        } else {
+            message = await channel.send(payload);
+        }
+
+        return message;
+    } catch (error) {
+        console.error(
+            "❌ BlocksMC Discord status message update failed:",
+            error.message || error
+        );
+        return null;
+    }
+}
+
+async function startMinecraftAutoStatus() {
+    if (!MC_STATUS_CHANNEL_ID) {
+        console.log(
+            "ℹ️ BlocksMC automatic status is disabled. Set MC_STATUS_CHANNEL_ID to enable it."
+        );
+        return;
+    }
+
+    const channel = await client.channels.fetch(
+        MC_STATUS_CHANNEL_ID
+    ).catch(() => null);
+
+    if (!channel || !channel.isTextBased()) {
+        console.error(
+            "❌ MC_STATUS_CHANNEL_ID is invalid or is not a text channel."
+        );
+        return;
+    }
+
+    const saved = loadJson(
+        MC_STATUS_MESSAGE_FILE,
+        { messageId: null }
+    );
+
+    let message = await updateMinecraftStatusMessage(
+        channel,
+        saved.messageId
+    );
+
+    if (message) {
+        saveJson(
+            MC_STATUS_MESSAGE_FILE,
+            { messageId: message.id, channelId: channel.id }
+        );
+    }
+
+    setInterval(async () => {
+        try {
+            const current = loadJson(
+                MC_STATUS_MESSAGE_FILE,
+                { messageId: null }
+            );
+
+            message = await updateMinecraftStatusMessage(
+                channel,
+                current.messageId
+            );
+
+            if (message) {
+                saveJson(
+                    MC_STATUS_MESSAGE_FILE,
+                    { messageId: message.id, channelId: channel.id }
+                );
+            }
+        } catch (error) {
+            console.error(
+                "❌ BlocksMC automatic status update failed:",
+                error.message || error
+            );
+        }
+    }, MC_AUTO_UPDATE_INTERVAL);
+
+    console.log(
+        `✅ BlocksMC automatic status enabled in channel ${channel.id}.`
+    );
+}
 
 // =====================================================
 // STAFF CHECK
@@ -189,7 +715,7 @@ async function addWarning(member, reason) {
             .setColor(0xED4245)
             .setTitle("⚠️ S1N GUILD WARNING")
             .setDescription(
-                "Your message was removed because it violated the **S1N Guild rules**.\n\n" +
+                "You have received a **moderation warning** in S1N Guild.\n\n" +
                 `📌 **Reason:** ${reason}\n` +
                 `⚠️ **Warnings:** ${count}/${WARNINGS_BEFORE_TIMEOUT}\n\n` +
                 (
@@ -410,12 +936,6 @@ const commands = [
         ),
 
     new SlashCommandBuilder()
-        .setName("mute")
-        .setDescription(
-            "OWNER ONLY: Mute or unmute the entire server"
-        ),
-
-    new SlashCommandBuilder()
         .setName("add-level")
         .setDescription(
             "OWNER ONLY: Add levels"
@@ -517,6 +1037,24 @@ const commands = [
         ),
 
     new SlashCommandBuilder()
+        .setName("warn")
+        .setDescription("Warn a member with a reason")
+        .addUserOption(option =>
+            option
+                .setName("user")
+                .setDescription("Member to warn")
+                .setRequired(true)
+        )
+        .addStringOption(option =>
+            option
+                .setName("reason")
+                .setDescription("Reason for the warning")
+                .setRequired(true)
+                .setMinLength(1)
+                .setMaxLength(500)
+        ),
+
+    new SlashCommandBuilder()
         .setName("clear-warnings")
         .setDescription(
             "Clear warnings"
@@ -550,6 +1088,21 @@ const commands = [
                     "Minutes"
                 )
                 .setRequired(true)
+        ),
+
+    new SlashCommandBuilder()
+        .setName("gambling")
+        .setDescription("Show the fun-only gambling registration panel")
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("register")
+                .setDescription("Open the fun-only gambling registration panel")
+        ),
+
+    new SlashCommandBuilder()
+        .setName("mcstatus")
+        .setDescription(
+            "View the live BlocksMC server status"
         ),
 
     new SlashCommandBuilder()
@@ -672,26 +1225,6 @@ client.on(
         }
 
         // =============================================
-        // SERVER MUTE
-        // OWNER IS THE ONLY PERSON WHO CAN TALK
-        // =============================================
-
-        const isOwner =
-            message.author.id ===
-            message.guild.ownerId;
-
-        if (
-            botConfig.serverMute &&
-            !isOwner
-        ) {
-
-            await message.delete()
-                .catch(() => {});
-
-            return;
-        }
-
-        // =============================================
         // MAINTENANCE
         // =============================================
 
@@ -805,24 +1338,117 @@ client.on(
 
                 if (commandName === "gambles") {
                     const websiteUrl = `${S1N_WEBSITE_URL}/`;
-                    const credits = getCredits(user.id);
-                    const oauthUrl = DISCORD_CLIENT_SECRET && DISCORD_OAUTH_REDIRECT_URI
+                    const oauthUrl = DISCORD_OAUTH_REDIRECT_URI
                         ? `https://discord.com/oauth2/authorize?client_id=${encodeURIComponent(CLIENT_ID)}&response_type=code&redirect_uri=${encodeURIComponent(DISCORD_OAUTH_REDIRECT_URI)}&scope=identify`
                         : websiteUrl;
 
                     const row = new ActionRowBuilder().addComponents(
-                        new ButtonBuilder().setLabel("🎰 Open S1N Gambles").setStyle(ButtonStyle.Link).setURL(websiteUrl),
-                        new ButtonBuilder().setLabel("🔗 Connect Discord").setStyle(ButtonStyle.Link).setURL(oauthUrl)
+                        new ButtonBuilder()
+                            .setLabel("🎰 Open S1N Gambles")
+                            .setStyle(ButtonStyle.Link)
+                            .setURL(websiteUrl),
+                        new ButtonBuilder()
+                            .setLabel("🔗 Connect Discord")
+                            .setStyle(ButtonStyle.Link)
+                            .setURL(oauthUrl)
                     );
 
                     const embed = new EmbedBuilder()
                         .setColor(0x9147ff)
                         .setTitle("🎰 S1N GAMBLES")
-                        .setDescription(`Your current **SIN Credits** balance is **${credits.toLocaleString()}**.\n\nConnect your Discord account on the website to use the same balance there.`)
+                        .setDescription(
+                            `Your current **SIN Credits** balance is **${getCredits(user.id).toLocaleString()}**.\\n\\n` +
+                            "Connect your Discord account on the website to use the same balance there."
+                        )
                         .setFooter({ text: "S1N Gambles • Virtual Credits" })
                         .setTimestamp();
 
-                    return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+                    return interaction.reply({
+                        embeds: [embed],
+                        components: [row],
+                        ephemeral: true
+                    });
+                }
+
+                // =============================================
+                // FUN-ONLY GAMBLING REGISTRATION
+                // =============================================
+
+                if (commandName === "gambling" && options.getSubcommand() === "register") {
+
+                    // OWNER ONLY
+                    if (user.id !== guild.ownerId) {
+                        return interaction.reply({
+                            content: "❌ **Owner only.** Only the server owner can use `/gambling register`.",
+                            ephemeral: true
+                        });
+                    }
+
+                    const websiteUrl = `${S1N_WEBSITE_URL}/`;
+                    const oauthClientId = CLIENT_ID;
+                    const oauthRedirectUri = DISCORD_OAUTH_REDIRECT_URI;
+
+                    const row = new ActionRowBuilder().addComponents(
+                        new ButtonBuilder()
+                            .setLabel("🎰 Enter Fun Gambling")
+                            .setStyle(ButtonStyle.Link)
+                            .setURL(websiteUrl),
+                        new ButtonBuilder()
+                            .setLabel("🔗 Connect Discord")
+                            .setStyle(ButtonStyle.Link)
+                            .setURL(
+                                oauthClientId && oauthRedirectUri
+                                    ? `https://discord.com/oauth2/authorize?client_id=${encodeURIComponent(oauthClientId)}&response_type=code&redirect_uri=${encodeURIComponent(oauthRedirectUri)}&scope=identify`
+                                    : websiteUrl
+                            )
+                    );
+
+                    const embed = new EmbedBuilder()
+                        .setColor(0x5865F2)
+                        .setTitle("🎰 Fun Gambling Registration")
+                        .setDescription(
+                            "This server does **not promote or endorse real-money gambling**.\n\n" +
+                            "This feature is **fictional/fun-only** for server members. No real money, deposits, withdrawals, prizes, or cash wagering are supported by this Discord bot.\n\n" +
+                            "🔞 **18+ only** — Discord's current age-restricted command rules require age-restricted app functionality to be limited to adults.\n\n" +
+                            "By continuing to the website, review its own terms and age requirements before using any feature."
+                        )
+                        .addFields({
+                            name: "🌐 Website",
+                            value: `[s1ngambles.netlify.app](${websiteUrl})`,
+                            inline: false
+                        })
+                        .setFooter({
+                            text: "S1N Guild • Fun-only / no real-money gambling"
+                        })
+                        .setTimestamp();
+
+                    return interaction.reply({
+                        embeds: [embed],
+                        components: [row]
+                    });
+                }
+
+                // =============================================
+                // MINECRAFT STATUS
+                // =============================================
+
+                if (
+                    commandName ===
+                    "mcstatus"
+                ) {
+                    await interaction.deferReply();
+
+                    const result =
+                        await getMinecraftStatusResult();
+
+                    return interaction.editReply({
+                        embeds: [
+                            createMinecraftStatusEmbed(result)
+                        ],
+                        components: [
+                            createMinecraftStatusButtons()
+                        ]
+                    });
                 }
 
                 // =============================================
@@ -898,7 +1524,8 @@ client.on(
                                 "📜 `/rules` — View rules\n" +
                                 "🔗 `/invite` — Official invite\n" +
                                 "📊 `/level` — Check level\n" +
-                                "🔇 `/mute` — Owner-only server mute\n\n" +
+                                "🎮 `/mcstatus` — View live BlocksMC status\n" +
+                                "🎰 `/gambling register` — Fun-only gambling registration\n" +
 
                                 "🎫 `/setup-ticket` — Support panel\n" +
                                 "🏆 `/setup-tournament` — Tournament panel\n" +
@@ -910,6 +1537,7 @@ client.on(
                                 "🏁 `/giveaway-end` — End giveaway\n" +
                                 "📢 `/announcement` — Announcement\n\n" +
 
+                                "⚠️ `/warn <user> <reason>` — Warn a member\n" +
                                 "⚠️ `/warnings` — Check warnings\n" +
                                 "🔨 `/timeout` — Timeout member\n" +
                                 "👢 `/kick` — Kick member\n\n" +
@@ -1018,97 +1646,6 @@ client.on(
                             status === "on"
                                 ? "🚨 **MAINTENANCE MODE ENABLED**"
                                 : "✅ **MAINTENANCE MODE DISABLED**",
-                        ephemeral: true
-                    });
-                }
-
-                // =============================================
-                // SERVER MUTE
-                // OWNER ONLY
-                // =============================================
-
-                if (
-                    commandName ===
-                    "mute"
-                ) {
-
-                    if (
-                        user.id !==
-                        guild.ownerId
-                    ) {
-                        return interaction.reply({
-                            content:
-                                "❌ **Owner only.** Only the server owner can use `/mute`.",
-                            ephemeral: true
-                        });
-                    }
-
-                    botConfig.serverMute =
-                        !botConfig.serverMute;
-
-                    saveJson(
-                        CONFIG_FILE,
-                        botConfig
-                    );
-
-                    // Update channel permissions
-                    try {
-
-                        for (
-                            const serverChannel
-                            of guild.channels.cache.values()
-                        ) {
-
-                            if (
-                                !serverChannel.isTextBased() ||
-                                !serverChannel.permissionOverwrites
-                            ) {
-                                continue;
-                            }
-
-                            if (
-                                botConfig.serverMute
-                            ) {
-
-                                await serverChannel.permissionOverwrites.edit(
-                                    guild.roles.everyone,
-                                    {
-                                        SendMessages: false
-                                    },
-                                    {
-                                        reason:
-                                            "S1N Server Mute Enabled"
-                                    }
-                                ).catch(() => {});
-
-                            } else {
-
-                                await serverChannel.permissionOverwrites.edit(
-                                    guild.roles.everyone,
-                                    {
-                                        SendMessages: null
-                                    },
-                                    {
-                                        reason:
-                                            "S1N Server Mute Disabled"
-                                    }
-                                ).catch(() => {});
-                            }
-                        }
-
-                    } catch (error) {
-
-                        console.error(
-                            "Server mute permission update error:",
-                            error
-                        );
-                    }
-
-                    return interaction.reply({
-                        content:
-                            botConfig.serverMute
-                                ? "🔇 **SERVER MUTED**\n\nEveryone in the server is now muted. Only the **server owner** can talk."
-                                : "🔊 **SERVER UNMUTED**\n\nServer chat has been restored.",
                         ephemeral: true
                     });
                 }
@@ -1600,112 +2137,114 @@ client.on(
                         ephemeral: true
                     });
                 }
+// =============================================
+// ANNOUNCEMENT
+// =============================================
 
-                // =============================================
-                // ANNOUNCEMENT
-                // =============================================
+if (
+    commandName ===
+    "announcement"
+) {
 
-                if (
-                    commandName ===
-                    "announcement"
-                ) {
+    if (
+        !isStaff(member)
+    ) {
+        return interaction.reply({
+            content:
+                "❌ No permission.",
+            ephemeral: true
+        });
+    }
 
-                    if (
-                        !isStaff(member)
-                    ) {
-                        return interaction.reply({
-                            content:
-                                "❌ No permission.",
-                            ephemeral: true
-                        });
-                    }
+    const title =
+        options
+            .getString("title")
+            .trim();
 
-                    const title =
-                        options
-                            .getString("title")
-                            .trim();
+    const rawMessage =
+        options.getString("message");
 
-                    const rawMessage =
-                        options.getString("message");
+    // Split message using |
+    const lines =
+        rawMessage
+            .split("|")
+            .map(line => line.trim())
+            .filter(Boolean);
 
-                    const lines =
-                        rawMessage
-                            .split("|")
-                            .map(line => line.trim())
-                            .filter(Boolean);
+    // Clean, aesthetic announcement body
+    const description =
+        lines
+            .map(line => `**${line}**`)
+            .join("\n\n");
 
-                    const description =
-                        lines
-                            .map(line => `**${line}**`)
-                            .join("\n\n");
+    const embed =
+        new EmbedBuilder()
+            .setColor(0x5865F2)
 
-                    const embed =
-                        new EmbedBuilder()
-                            .setColor(0x5865F2)
+            // S1N BOT LOGO / SERVER ICON
+            .setAuthor({
+                name: "S1N GUILD",
+                iconURL:
+                    guild.iconURL({
+                        extension: "png",
+                        size: 128
+                    }) || undefined
+            })
 
-                            .setAuthor({
-                                name: "S1N GUILD",
-                                iconURL:
-                                    guild.iconURL({
-                                        extension: "png",
-                                        size: 128
-                                    }) || undefined
-                            })
+            .setTitle(
+                `📢 ${title}`
+            )
 
-                            .setTitle(
-                                `📢 ${title}`
-                            )
+            .setDescription(
+                description
+            )
 
-                            .setDescription(
-                                description
-                            )
+            .setThumbnail(
+                guild.iconURL({
+                    extension: "png",
+                    size: 256
+                }) || null
+            )
 
-                            .setThumbnail(
-                                guild.iconURL({
-                                    extension: "png",
-                                    size: 256
-                                }) || null
-                            )
+            .setFooter({
+                text:
+                    `S1N Guild • Published by ${user.username}`,
+                iconURL:
+                    client.user.displayAvatarURL({
+                        extension: "png",
+                        size: 64
+                    })
+            })
 
-                            .setFooter({
-                                text:
-                                    `S1N Guild • Published by ${user.username}`,
-                                iconURL:
-                                    client.user.displayAvatarURL({
-                                        extension: "png",
-                                        size: 64
-                                    })
-                            })
+            .setTimestamp();
 
-                            .setTimestamp();
+    const shouldPing =
+        options.getBoolean("ping") ?? true;
 
-                    const shouldPing =
-                        options.getBoolean("ping") ?? true;
+    await channel.send({
+        content:
+            shouldPing
+                ? "@everyone"
+                : undefined,
 
-                    await channel.send({
-                        content:
-                            shouldPing
-                                ? "@everyone"
-                                : undefined,
+        embeds: [embed],
 
-                        embeds: [embed],
-
-                        allowedMentions:
-                            shouldPing
-                                ? {
-                                    parse: ["everyone"]
-                                }
-                                : {
-                                    parse: []
-                                }
-                    });
-
-                    return interaction.reply({
-                        content:
-                            "✅ Announcement broadcasted.",
-                        ephemeral: true
-                    });
+        allowedMentions:
+            shouldPing
+                ? {
+                    parse: ["everyone"]
                 }
+                : {
+                    parse: []
+                }
+    });
+
+    return interaction.reply({
+        content:
+            "✅ Announcement broadcasted.",
+        ephemeral: true
+    });
+}
 
                 // =============================================
                 // GIVEAWAY CREATE
@@ -1839,7 +2378,9 @@ client.on(
 
                     saveJson(
                         GIVEAWAY_FILE,
-                        Object.fromEntries(giveaways)
+                        Object.fromEntries(
+                            giveaways
+                        )
                     );
 
                     setTimeout(
@@ -1895,6 +2436,79 @@ client.on(
                                 ? "🏆 Giveaway ended."
                                 : "❌ Giveaway not found.",
                         ephemeral: true
+                    });
+                }
+
+                // =============================================
+                // WARN MEMBER
+                // =============================================
+
+                if (commandName === "warn") {
+                    if (!isStaff(member)) {
+                        return interaction.reply({
+                            content: "❌ No permission.",
+                            ephemeral: true
+                        });
+                    }
+
+                    const targetUser = options.getUser("user", true);
+                    const reason = options.getString("reason", true).trim();
+
+                    if (!reason) {
+                        return interaction.reply({
+                            content: "❌ Please provide a reason for the warning.",
+                            ephemeral: true
+                        });
+                    }
+
+                    const targetMember = await guild.members.fetch(targetUser.id).catch(() => null);
+
+                    if (!targetMember) {
+                        return interaction.reply({
+                            content: "❌ That user is not a member of this server.",
+                            ephemeral: true
+                        });
+                    }
+
+                    if (targetMember.id === user.id) {
+                        return interaction.reply({
+                            content: "❌ You cannot warn yourself.",
+                            ephemeral: true
+                        });
+                    }
+
+                    if (targetMember.id === client.user.id) {
+                        return interaction.reply({
+                            content: "❌ I cannot warn myself.",
+                            ephemeral: true
+                        });
+                    }
+
+                    if (targetMember.roles.highest.position >= member.roles.highest.position &&
+                        guild.ownerId !== user.id) {
+                        return interaction.reply({
+                            content: "❌ You can only warn members below your highest role.",
+                            ephemeral: true
+                        });
+                    }
+
+                    const count = await addWarning(targetMember, reason);
+
+                    return interaction.reply({
+                        embeds: [
+                            new EmbedBuilder()
+                                .setColor(0xED4245)
+                                .setTitle("⚠️ Member Warned")
+                                .setDescription(
+                                    `${targetMember} has received a warning.`
+                                )
+                                .addFields(
+                                    { name: "👤 Member", value: `${targetMember.user.tag}`, inline: true },
+                                    { name: "📌 Reason", value: reason.slice(0, 1024), inline: true },
+                                    { name: "⚠️ Warnings", value: `${count}/${WARNINGS_BEFORE_TIMEOUT}`, inline: true }
+                                )
+                                .setTimestamp()
+                        ]
                     });
                 }
 
@@ -2115,6 +2729,49 @@ client.on(
             ) {
 
                 // =============================================
+                // BLOCKS MC STATUS REFRESH
+                // =============================================
+
+                if (
+                    interaction.customId ===
+                    "mcstatus_refresh"
+                ) {
+                    const remaining =
+                        isMinecraftRefreshRateLimited(
+                            interaction.user.id
+                        );
+
+                    if (remaining > 0) {
+                        return interaction.reply({
+                            content:
+                                `⏳ Please wait ${remaining}s before refreshing the BlocksMC status again.`,
+                            ephemeral: true
+                        });
+                    }
+
+                    await interaction.deferUpdate();
+
+                    const result =
+                        await getMinecraftStatusResult();
+
+                    await interaction.message.edit({
+                        embeds: [
+                            createMinecraftStatusEmbed(result)
+                        ],
+                        components: [
+                            createMinecraftStatusButtons()
+                        ]
+                    }).catch(error => {
+                        console.error(
+                            "❌ BlocksMC refresh edit failed:",
+                            error.message || error
+                        );
+                    });
+
+                    return;
+                }
+
+                // =============================================
                 // ADMIN APPLICATION ACCEPT / DECLINE
                 // =============================================
 
@@ -2127,6 +2784,7 @@ client.on(
                     )
                 ) {
 
+                    // Only staff can review applications
                     if (
                         !isStaff(
                             interaction.member
@@ -2232,6 +2890,7 @@ client.on(
                         components: []
                     });
 
+                    // Notify applicant
                     try {
 
                         const applicant =
@@ -2273,7 +2932,9 @@ client.on(
                             ]
                         });
 
-                    } catch {}
+                    } catch {
+                        // Applicant may have DMs disabled
+                    }
 
                     return interaction.reply({
                         content:
@@ -3598,6 +4259,9 @@ client.once(
             },
             60 * 60 * 1000
         );
+
+        // Optional BlocksMC automatic status message
+        await startMinecraftAutoStatus();
     }
 );
 
@@ -3615,135 +4279,515 @@ client.login(TOKEN);
 function parseCookies(req) {
     const header = req.headers.cookie || "";
     const cookies = {};
+
     for (const part of header.split(";")) {
         const index = part.indexOf("=");
+
         if (index === -1) continue;
-        cookies[part.slice(0, index).trim()] = decodeURIComponent(part.slice(index + 1).trim());
+
+        cookies[
+            part.slice(0, index).trim()
+        ] = decodeURIComponent(
+            part.slice(index + 1).trim()
+        );
     }
+
     return cookies;
 }
 
 function getWebUser(req) {
     const sid = parseCookies(req).s1n_session;
-    return sid ? webSessions.get(sid) || null : null;
+
+    return sid
+        ? webSessions.get(sid) || null
+        : null;
 }
 
 function sendJson(res, status, data, origin) {
     res.writeHead(status, {
-        "Content-Type": "application/json; charset=utf-8",
-        "Access-Control-Allow-Origin": origin || S1N_WEBSITE_URL,
-        "Access-Control-Allow-Credentials": "true",
-        "Vary": "Origin"
+        "Content-Type":
+            "application/json; charset=utf-8",
+        "Access-Control-Allow-Origin":
+            origin || S1N_WEBSITE_URL,
+        "Access-Control-Allow-Credentials":
+            "true",
+        "Vary":
+            "Origin"
     });
-    res.end(JSON.stringify(data));
+
+    res.end(
+        JSON.stringify(data)
+    );
 }
 
 function startWebServer() {
-    const server = http.createServer(async (req, res) => {
-        const requestUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-        const origin = req.headers.origin || S1N_WEBSITE_URL;
+    const server =
+        http.createServer(
+            async (req, res) => {
 
-        if (req.method === "OPTIONS") {
-            res.writeHead(204, {
-                "Access-Control-Allow-Origin": origin,
-                "Access-Control-Allow-Credentials": "true",
-                "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type",
-                "Vary": "Origin"
-            });
-            return res.end();
-        }
+                const requestUrl =
+                    new URL(
+                        req.url,
+                        `http://${req.headers.host || "localhost"}`
+                    );
 
-        try {
-            if (requestUrl.pathname === "/auth/discord" && req.method === "GET") {
-                if (!DISCORD_CLIENT_SECRET || !DISCORD_OAUTH_REDIRECT_URI) {
-                    return sendJson(res, 500, { error: "Discord OAuth is not configured on Railway." }, origin);
-                }
-                const oauthUrl = new URL("https://discord.com/oauth2/authorize");
-                oauthUrl.searchParams.set("client_id", CLIENT_ID);
-                oauthUrl.searchParams.set("response_type", "code");
-                oauthUrl.searchParams.set("redirect_uri", DISCORD_OAUTH_REDIRECT_URI);
-                oauthUrl.searchParams.set("scope", "identify");
-                res.writeHead(302, { Location: oauthUrl.toString() });
-                return res.end();
-            }
+                const origin =
+                    req.headers.origin ||
+                    S1N_WEBSITE_URL;
 
-            if (requestUrl.pathname === "/auth/discord/callback" && req.method === "GET") {
-                const code = requestUrl.searchParams.get("code");
-                if (!code || !DISCORD_CLIENT_SECRET || !DISCORD_OAUTH_REDIRECT_URI) {
-                    res.writeHead(302, { Location: `${S1N_WEBSITE_URL}/?discord=error` });
+                if (req.method === "OPTIONS") {
+
+                    res.writeHead(
+                        204,
+                        {
+                            "Access-Control-Allow-Origin":
+                                origin,
+
+                            "Access-Control-Allow-Credentials":
+                                "true",
+
+                            "Access-Control-Allow-Methods":
+                                "GET,POST,OPTIONS",
+
+                            "Access-Control-Allow-Headers":
+                                "Content-Type",
+
+                            "Vary":
+                                "Origin"
+                        }
+                    );
+
                     return res.end();
                 }
-                const tokenResponse = await fetch("https://discord.com/api/oauth2/token", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                    body: new URLSearchParams({
-                        client_id: CLIENT_ID, client_secret: DISCORD_CLIENT_SECRET,
-                        grant_type: "authorization_code", code, redirect_uri: DISCORD_OAUTH_REDIRECT_URI
-                    })
-                });
-                if (!tokenResponse.ok) {
-                    res.writeHead(302, { Location: `${S1N_WEBSITE_URL}/?discord=error` });
-                    return res.end();
+
+                try {
+
+                    // =============================================
+                    // DISCORD LOGIN
+                    // =============================================
+
+                    if (
+                        requestUrl.pathname ===
+                            "/auth/discord" &&
+                        req.method === "GET"
+                    ) {
+
+                        if (
+                            !DISCORD_CLIENT_SECRET ||
+                            !DISCORD_OAUTH_REDIRECT_URI
+                        ) {
+
+                            return sendJson(
+                                res,
+                                500,
+                                {
+                                    error:
+                                        "Discord OAuth is not configured on Railway."
+                                },
+                                origin
+                            );
+                        }
+
+                        const oauthUrl =
+                            new URL(
+                                "https://discord.com/oauth2/authorize"
+                            );
+
+                        oauthUrl.searchParams.set(
+                            "client_id",
+                            CLIENT_ID
+                        );
+
+                        oauthUrl.searchParams.set(
+                            "response_type",
+                            "code"
+                        );
+
+                        oauthUrl.searchParams.set(
+                            "redirect_uri",
+                            DISCORD_OAUTH_REDIRECT_URI
+                        );
+
+                        oauthUrl.searchParams.set(
+                            "scope",
+                            "identify"
+                        );
+
+                        res.writeHead(
+                            302,
+                            {
+                                Location:
+                                    oauthUrl.toString()
+                            }
+                        );
+
+                        return res.end();
+                    }
+
+                    // =============================================
+                    // DISCORD OAUTH CALLBACK
+                    // =============================================
+
+                    if (
+                        requestUrl.pathname ===
+                            "/auth/discord/callback" &&
+                        req.method === "GET"
+                    ) {
+
+                        const code =
+                            requestUrl.searchParams.get(
+                                "code"
+                            );
+
+                        if (
+                            !code ||
+                            !DISCORD_CLIENT_SECRET ||
+                            !DISCORD_OAUTH_REDIRECT_URI
+                        ) {
+
+                            res.writeHead(
+                                302,
+                                {
+                                    Location:
+                                        `${S1N_WEBSITE_URL}/?discord=error`
+                                }
+                            );
+
+                            return res.end();
+                        }
+
+                        const tokenResponse =
+                            await fetch(
+                                "https://discord.com/api/oauth2/token",
+                                {
+                                    method:
+                                        "POST",
+
+                                    headers: {
+                                        "Content-Type":
+                                            "application/x-www-form-urlencoded"
+                                    },
+
+                                    body:
+                                        new URLSearchParams({
+                                            client_id:
+                                                CLIENT_ID,
+
+                                            client_secret:
+                                                DISCORD_CLIENT_SECRET,
+
+                                            grant_type:
+                                                "authorization_code",
+
+                                            code,
+
+                                            redirect_uri:
+                                                DISCORD_OAUTH_REDIRECT_URI
+                                        })
+                                }
+                            );
+
+                        if (!tokenResponse.ok) {
+
+                            res.writeHead(
+                                302,
+                                {
+                                    Location:
+                                        `${S1N_WEBSITE_URL}/?discord=error`
+                                }
+                            );
+
+                            return res.end();
+                        }
+
+                        const tokenData =
+                            await tokenResponse.json();
+
+                        const userResponse =
+                            await fetch(
+                                "https://discord.com/api/users/@me",
+                                {
+                                    headers: {
+                                        Authorization:
+                                            `Bearer ${tokenData.access_token}`
+                                    }
+                                }
+                            );
+
+                        if (!userResponse.ok) {
+
+                            res.writeHead(
+                                302,
+                                {
+                                    Location:
+                                        `${S1N_WEBSITE_URL}/?discord=error`
+                                }
+                            );
+
+                            return res.end();
+                        }
+
+                        const discordUser =
+                            await userResponse.json();
+
+                        const sessionId =
+                            crypto
+                                .randomBytes(32)
+                                .toString("hex");
+
+                        webSessions.set(
+                            sessionId,
+                            {
+                                id:
+                                    discordUser.id,
+
+                                username:
+                                    discordUser.username,
+
+                                global_name:
+                                    discordUser.global_name ||
+                                    discordUser.username,
+
+                                avatar:
+                                    discordUser.avatar ||
+                                    null
+                            }
+                        );
+
+                        res.writeHead(
+                            302,
+                            {
+                                "Set-Cookie":
+                                    `s1n_session=${encodeURIComponent(sessionId)}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=604800`,
+
+                                Location:
+                                    `${S1N_WEBSITE_URL}/?discord=connected`
+                            }
+                        );
+
+                        return res.end();
+                    }
+
+                    // =============================================
+                    // LOGOUT
+                    // =============================================
+
+                    if (
+                        requestUrl.pathname ===
+                            "/auth/logout" &&
+                        req.method === "POST"
+                    ) {
+
+                        const sid =
+                            parseCookies(
+                                req
+                            ).s1n_session;
+
+                        if (sid) {
+                            webSessions.delete(
+                                sid
+                            );
+                        }
+
+                        return sendJson(
+                            res,
+                            200,
+                            {
+                                ok:
+                                    true
+                            },
+                            origin
+                        );
+                    }
+
+                    // =============================================
+                    // CURRENT USER
+                    // =============================================
+
+                    if (
+                        requestUrl.pathname ===
+                            "/api/me" &&
+                        req.method === "GET"
+                    ) {
+
+                        const user =
+                            getWebUser(req);
+
+                        if (!user) {
+
+                            return sendJson(
+                                res,
+                                200,
+                                {
+                                    authenticated:
+                                        false,
+
+                                    balance:
+                                        0
+                                },
+                                origin
+                            );
+                        }
+
+                        return sendJson(
+                            res,
+                            200,
+                            {
+                                authenticated:
+                                    true,
+
+                                user,
+
+                                balance:
+                                    getCredits(
+                                        user.id
+                                    )
+                            },
+                            origin
+                        );
+                    }
+
+                    // =============================================
+                    // BALANCE
+                    // =============================================
+
+                    if (
+                        requestUrl.pathname ===
+                            "/api/balance" &&
+                        req.method === "POST"
+                    ) {
+
+                        const user =
+                            getWebUser(req);
+
+                        if (!user) {
+
+                            return sendJson(
+                                res,
+                                401,
+                                {
+                                    error:
+                                        "Not authenticated"
+                                },
+                                origin
+                            );
+                        }
+
+                        let body = "";
+
+                        for await (
+                            const chunk of req
+                        ) {
+                            body += chunk;
+                        }
+
+                        let data;
+
+                        try {
+                            data =
+                                JSON.parse(
+                                    body ||
+                                        "{}"
+                                );
+                        } catch {
+
+                            return sendJson(
+                                res,
+                                400,
+                                {
+                                    error:
+                                        "Invalid JSON"
+                                },
+                                origin
+                            );
+                        }
+
+                        const amount =
+                            Number(
+                                data.amount
+                            );
+
+                        if (
+                            !Number.isFinite(
+                                amount
+                            ) ||
+                            Math.abs(amount) >
+                                100000000
+                        ) {
+
+                            return sendJson(
+                                res,
+                                400,
+                                {
+                                    error:
+                                        "Invalid credit amount"
+                                },
+                                origin
+                            );
+                        }
+
+                        return sendJson(
+                            res,
+                            200,
+                            {
+                                ok:
+                                    true,
+
+                                balance:
+                                    addCredits(
+                                        user.id,
+                                        amount
+                                    )
+                            },
+                            origin
+                        );
+                    }
+
+                    res.writeHead(
+                        404,
+                        {
+                            "Content-Type":
+                                "text/plain; charset=utf-8"
+                        }
+                    );
+
+                    res.end(
+                        "Not found"
+                    );
+
+                } catch (error) {
+
+                    console.error(
+                        "S1N web server error:",
+                        error
+                    );
+
+                    if (!res.headersSent) {
+
+                        sendJson(
+                            res,
+                            500,
+                            {
+                                error:
+                                    "Internal server error"
+                            },
+                            origin
+                        );
+
+                    } else {
+                        res.end();
+                    }
                 }
-                const tokenData = await tokenResponse.json();
-                const userResponse = await fetch("https://discord.com/api/users/@me", {
-                    headers: { Authorization: `Bearer ${tokenData.access_token}` }
-                });
-                if (!userResponse.ok) {
-                    res.writeHead(302, { Location: `${S1N_WEBSITE_URL}/?discord=error` });
-                    return res.end();
-                }
-                const discordUser = await userResponse.json();
-                const sessionId = crypto.randomBytes(32).toString("hex");
-                webSessions.set(sessionId, {
-                    id: discordUser.id, username: discordUser.username,
-                    global_name: discordUser.global_name || discordUser.username,
-                    avatar: discordUser.avatar || null
-                });
-                res.writeHead(302, {
-                    "Set-Cookie": `s1n_session=${encodeURIComponent(sessionId)}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=604800`,
-                    Location: `${S1N_WEBSITE_URL}/?discord=connected`
-                });
-                return res.end();
             }
+        );
 
-            if (requestUrl.pathname === "/auth/logout" && req.method === "POST") {
-                const sid = parseCookies(req).s1n_session;
-                if (sid) webSessions.delete(sid);
-                return sendJson(res, 200, { ok: true }, origin);
-            }
-
-            if (requestUrl.pathname === "/api/me" && req.method === "GET") {
-                const user = getWebUser(req);
-                if (!user) return sendJson(res, 200, { authenticated: false, balance: 0 }, origin);
-                return sendJson(res, 200, { authenticated: true, user, balance: getCredits(user.id) }, origin);
-            }
-
-            if (requestUrl.pathname === "/api/balance" && req.method === "POST") {
-                const user = getWebUser(req);
-                if (!user) return sendJson(res, 401, { error: "Not authenticated" }, origin);
-                let body = "";
-                for await (const chunk of req) body += chunk;
-                let data;
-                try { data = JSON.parse(body || "{}"); } catch { return sendJson(res, 400, { error: "Invalid JSON" }, origin); }
-                const amount = Number(data.amount);
-                if (!Number.isFinite(amount) || Math.abs(amount) > 100000000) {
-                    return sendJson(res, 400, { error: "Invalid credit amount" }, origin);
-                }
-                return sendJson(res, 200, { ok: true, balance: addCredits(user.id, amount) }, origin);
-            }
-
-            res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
-            res.end("Not found");
-        } catch (error) {
-            console.error("S1N web server error:", error);
-            if (!res.headersSent) sendJson(res, 500, { error: "Internal server error" }, origin);
-            else res.end();
-        }
-    });
-
-    server.listen(API_PORT, () => console.log(`🌐 S1N Gambles API running on port ${API_PORT}`));
+    server.listen(
+        API_PORT,
+        () =>
+            console.log(
+                `🌐 S1N Gambles API running on port ${API_PORT}`
+            )
+    );
 }
 
 startWebServer();
