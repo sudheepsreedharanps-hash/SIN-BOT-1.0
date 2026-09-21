@@ -113,6 +113,9 @@ let botConfig = loadJson(CONFIG_FILE, {
 
 const warnings = new Map();
 
+// Minecraft status refresh cooldowns (per user)
+const mcRefreshCooldowns = new Map();
+
 // =====================================================
 // MINECRAFT SERVER STATUS - BLOCKS MC
 // =====================================================
@@ -1309,6 +1312,15 @@ client.on(
                 // =============================================
 
                 if (commandName === "gambling" && options.getSubcommand() === "register") {
+
+                    // OWNER ONLY
+                    if (user.id !== guild.ownerId) {
+                        return interaction.reply({
+                            content: "❌ **Owner only.** Only the server owner can use `/gambling register`.",
+                            ephemeral: true
+                        });
+                    }
+
                     const websiteUrl = "https://s1ngambles.netlify.app/";
                     const oauthClientId = process.env.DISCORD_OAUTH_CLIENT_ID;
                     const oauthRedirectUri = process.env.DISCORD_OAUTH_REDIRECT_URI;
